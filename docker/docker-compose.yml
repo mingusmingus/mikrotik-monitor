@@ -1,0 +1,58 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: db
+    environment:
+      POSTGRES_DB: mikromon
+      POSTGRES_USER: mikromon
+      POSTGRES_PASSWORD: changeme
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    networks: [monnet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mikromon -d mikromon"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks: [monnet]
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on: [db]
+    networks: [monnet]
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: backend
+    env_file:
+      - ../backend/.env
+    command: ["/bin/sh","-c","/app/prestart.sh && uvicorn main:app --host 0.0.0.0 --port 8000"]
+    volumes:
+      - ../backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: [monnet]
+
+networks:
+  monnet:
+
+volumes:
+  dbdata:
