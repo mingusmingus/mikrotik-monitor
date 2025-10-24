@@ -1,58 +1,119 @@
-version: "3.9"
+version: '3.8'
+
 services:
   db:
-    image: postgres:16-alpine
-    container_name: db
+    image: postgres:14-alpine
     environment:
-      POSTGRES_DB: mikromon
-      POSTGRES_USER: mikromon
-      POSTGRES_PASSWORD: changeme
+      - POSTGRES_USER=${POSTGRES_USER:-mikromon}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme} 
+      - POSTGRES_DB=${POSTGRES_DB:-mikromon}
     volumes:
-      - dbdata:/var/lib/postgresql/data
-    networks: [monnet]
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mikromon -d mikromon"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mikromon}"]
       interval: 5s
-      timeout: 3s
-      retries: 10
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend-network
 
   redis:
-    image: redis:7-alpine
-    container_name: redis
-    networks: [monnet]
-
-  pgadmin:
-    image: dpage/pgadmin4:8
-    container_name: pgadmin
-    environment:
-      PGADMIN_DEFAULT_EMAIL: admin@local
-      PGADMIN_DEFAULT_PASSWORD: admin123
-    ports:
-      - "5050:80"
-    depends_on: [db]
-    networks: [monnet]
+    image: redis:alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend-network
 
   backend:
     build:
       context: ../backend
       dockerfile: Dockerfile
-    container_name: backend
-    env_file:
-      - ../backend/.env
-    command: ["/bin/sh","-c","/app/prestart.sh && uvicorn main:app --host 0.0.0.0 --port 8000"]
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
     volumes:
       - ../backend:/app
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-mikromon}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-mikromon}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required}
+      - REFRESH_SECRET_KEY=${REFRESH_SECRET_KEY:?REFRESH_SECRET_KEY is required}
+      - FERNET_KEY=${FERNET_KEY:?FERNET_KEY is required}
+      - ENV=production
+      - BACKEND_CORS_ORIGINS=["http://localhost:3000","http://frontend:3000"]
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
-    networks: [monnet]
+        condition: service_healthy
+    networks:
+      - backend-network
+      - frontend-network
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: celery -A app.core.celery_app.celery_app worker -Q monitor --loglevel=info
+    volumes:
+      - ../backend:/app
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-mikromon}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-mikromon}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - REFRESH_SECRET_KEY=${REFRESH_SECRET_KEY}
+      - FERNET_KEY=${FERNET_KEY}
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - backend-network
+
+  beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: celery -A app.core.celery_app.celery_app beat --loglevel=info
+    volumes:
+      - ../backend:/app  
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-mikromon}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-mikromon}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - REFRESH_SECRET_KEY=${REFRESH_SECRET_KEY}
+      - FERNET_KEY=${FERNET_KEY}
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - backend-network
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    environment: 
+      - REACT_APP_API_URL=http://localhost:8000/api
+      - NODE_ENV=development
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - frontend-network
 
 networks:
-  monnet:
+  backend-network:
+  frontend-network:
 
 volumes:
-  dbdata:
+  postgres_data:
+  redis_data:

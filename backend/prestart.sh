@@ -37,8 +37,8 @@ from app.core.security import hash_password
 db: Session = SessionLocal()
 plans = {
     "BASICMAAT": (5, 19.99, "Plan básico con hasta 5 dispositivos"),
-    "INTERMAAT": (15, 39.99, "Plan intermedio con hasta 15 dispositivos"),
-    "PROMAAT": (0, 79.99, "Plan profesional con dispositivos ilimitados"),
+    "INTERMAAT": (15, 39.99, "Plan intermedio con hasta 15 dispositivos"), 
+    "PROMAAT": (0, 79.99, "Plan profesional con dispositivos ilimitados")
 }
 for name,(maxd, price, desc) in plans.items():
     if not db.query(Plan).filter(Plan.nombre == name).first():

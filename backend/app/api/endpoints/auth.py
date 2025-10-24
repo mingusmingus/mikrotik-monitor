@@ -1,50 +1,59 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.db.models import User, Plan
-from app.schemas.user import UserCreate, UserLogin, UserOut
-from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token
-from app.core.config import settings
+from app.core.security import (
+    verify_password, create_access_token, create_refresh_token, decode_token
+)
+from app.schemas.auth import Token
+from app.db.models import User
 
 router = APIRouter()
 
-@router.post("/register", response_model=UserOut)
-def register(payload: UserCreate, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == payload.email).first():
-        raise HTTPException(status_code=400, detail="Email ya registrado")
-    u = User(
-        email=payload.email,
-        password=hash_password(payload.password),
-        nombre=payload.nombre,
-        plan_id=payload.plan_id,
-        activo=True,
-    )
-    db.add(u)
-    db.commit()
-    db.refresh(u)
-    return u
-
-@router.post("/login")
-def login(payload: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email, User.activo == True).first()
-    if not user or not verify_password(payload.password, user.password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
+@router.post("/login", response_model=Token)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales incorrectas",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     return {
         "access_token": create_access_token(user.email),
         "refresh_token": create_refresh_token(user.email),
-        "token_type": "bearer",
-        "user": UserOut.model_validate(user)
+        "token_type": "bearer"
     }
 
-@router.post("/refresh")
-def refresh(refresh_token: str, db: Session = Depends(get_db)):
-    # (por simplicidad) reusa decode en dependencies si deseas
-    from app.core.security import decode_token
+@router.post("/refresh", response_model=Token) 
+async def refresh_token(refresh_token: str, db: Session = Depends(get_db)):
     try:
         payload = decode_token(refresh_token)
-        if payload.get("type") != "refresh":
-            raise ValueError()
+        if payload.get("scope") != "refresh":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token de refresco inválido"
+            )
+        
         email = payload.get("sub")
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Usuario no encontrado"
+            )
+        
+        return {
+            "access_token": create_access_token(email),
+            "refresh_token": create_refresh_token(email),
+            "token_type": "bearer"
+        }
     except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    return {"access_token": create_access_token(email), "token_type": "bearer"}
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido o expirado"
+        )

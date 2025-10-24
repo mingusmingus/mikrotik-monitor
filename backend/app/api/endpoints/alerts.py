@@ -1,51 +1,44 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from typing import List
 from app.db.session import get_db
-from app.api.dependencies import get_current_user
-from app.db.models import Alert, Device
+from app.core.security import get_current_user
 from app.schemas.alert import AlertCreate, AlertOut
+from app.db.models import Alert, Device, User
 
 router = APIRouter()
 
-@router.get("/", response_model=list[AlertOut])
-def list_alerts(
-    authorization: str = Header(None),
-    db: Session = Depends(get_db),
-    device_id: int | None = None,
-    limit: int = Query(10, ge=1, le=100),
+@router.get("/", response_model=List[AlertOut])
+async def list_alerts(
+    status: str | None = Query(None, regex="^(Aviso|Alerta Menor|Alerta Severa|Alerta Crítica)$"),
+    limit: int = Query(10, ge=1, le=20),
     offset: int = Query(0, ge=0),
-    estado: str | None = Query(None, pattern="^(Aviso|Alerta Menor|Alerta Severa|Alerta Crítica)$")
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Falta token")
-    token = authorization.split(" ", 1)[1]
-    user = get_current_user(token, db)
-
-    q = db.query(Alert).join(Device, Alert.equipo_id == Device.id).filter(Device.usuario_id == user.id)
-    if device_id:
-        q = q.filter(Alert.equipo_id == device_id)
-    if estado:
-        q = q.filter(Alert.estado == estado)
-    q = q.order_by(Alert.fecha.desc()).limit(limit).offset(offset)
-    items = q.all()
-    return [AlertOut.model_validate(i) for i in items]
+    query = db.query(Alert).join(Device).filter(Device.usuario_id == current_user.id)
+    
+    if status:
+        query = query.filter(Alert.estado == status)
+    
+    return query.order_by(Alert.fecha.desc()).offset(offset).limit(limit).all()
 
 @router.post("/", response_model=AlertOut)
-def create_alert(payload: AlertCreate, authorization: str = Header(None), db: Session = Depends(get_db)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Falta token")
-    token = authorization.split(" ", 1)[1]
-    user = get_current_user(token, db)
-    dev = db.query(Device).filter(Device.id == payload.equipo_id, Device.usuario_id == user.id).first()
-    if not dev:
-        raise HTTPException(status_code=404, detail="Equipo no pertenece al usuario")
-    a = Alert(
-        equipo_id=payload.equipo_id,
-        estado=payload.estado,
-        titulo=payload.titulo,
-        descripcion=payload.descripcion
-    )
-    db.add(a)
+async def create_alert(
+    alert: AlertCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verificar que el dispositivo pertenece al usuario
+    device = db.query(Device).filter(
+        Device.id == alert.equipo_id,
+        Device.usuario_id == current_user.id
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    
+    db_alert = Alert(**alert.model_dump())
+    db.add(db_alert)
     db.commit()
-    db.refresh(a)
-    return a
+    db.refresh(db_alert)
+    return db_alert

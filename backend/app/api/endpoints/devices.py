@@ -1,65 +1,88 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from sqlalchemy.orm import Session
+from typing import List
 from sqlalchemy import func
 from app.db.session import get_db
-from app.api.dependencies import get_current_user
+from app.core.security import vault, get_current_user
+from app.schemas.device import DeviceCreate, DeviceUpdate, DeviceOut
 from app.db.models import Device, User, Plan
-from app.schemas.device import DeviceCreate, DeviceOut
-from app.core.security import encrypt_secret, decrypt_secret
 
 router = APIRouter()
 
-def _check_plan_limit(db: Session, user: User):
-    plan = db.get(Plan, user.plan_id) if user.plan_id else None
+def check_plan_limit(db: Session, user_id: int):
+    """Verifica límite de dispositivos según el plan del usuario"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.plan_id:
+        raise HTTPException(status_code=400, detail="Usuario sin plan asignado")
+    
+    plan = db.query(Plan).filter(Plan.id == user.plan_id).first()
     if not plan:
-        return
-    if plan.max_equipos == 0:
-        return
-    count = db.query(func.count(Device.id)).filter(Device.usuario_id == user.id).scalar()
-    if count >= plan.max_equipos:
-        raise HTTPException(status_code=403, detail="Límite de equipos alcanzado para tu plan")
+        raise HTTPException(status_code=400, detail="Plan no encontrado")
+        
+    if plan.max_equipos > 0:  # 0 = ilimitado
+        current_count = db.query(Device).filter(
+            Device.usuario_id == user_id
+        ).count()
+        if current_count >= plan.max_equipos:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Límite de {plan.max_equipos} dispositivos alcanzado"
+            )
+
+@router.get("/", response_model=List[DeviceOut])
+async def list_devices(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    return db.query(Device).filter(Device.usuario_id == current_user.id).all()
 
 @router.post("/", response_model=DeviceOut)
-def create_device(payload: DeviceCreate, authorization: str = Header(None), db: Session = Depends(get_db)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Falta token")
-    token = authorization.split(" ", 1)[1]
-    user = get_current_user(token, db)
-
-    _check_plan_limit(db, user)
-
-    dev = Device(
-        usuario_id=user.id,
-        nombre=payload.nombre,
-        ip=str(payload.ip),
-        puerto=payload.puerto,
-        usuario_mk_enc=encrypt_secret(payload.usuario_mk),
-        password_mk_enc=encrypt_secret(payload.password_mk),
-        activo=True
+async def create_device(
+    device: DeviceCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    check_plan_limit(db, current_user.id)
+    
+    db_device = Device(
+        usuario_id=current_user.id,
+        nombre=device.nombre,
+        ip=str(device.ip),
+        puerto=device.puerto,
+        usuario_mk_enc=vault.encrypt(device.usuario_mk),
+        password_mk_enc=vault.encrypt(device.password_mk)
     )
-    db.add(dev)
+    db.add(db_device)
     db.commit()
-    db.refresh(dev)
-    return dev
+    db.refresh(db_device)
+    return db_device
 
-@router.get("/", response_model=list[DeviceOut])
-def list_devices(authorization: str = Header(None), db: Session = Depends(get_db)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Falta token")
-    token = authorization.split(" ", 1)[1]
-    user = get_current_user(token, db)
-    items = db.query(Device).filter(Device.usuario_id == user.id).order_by(Device.id.desc()).all()
-    return [DeviceOut.model_validate(i) for i in items]
+@router.get("/{device_id}", response_model=DeviceOut)
+async def get_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    device = db.query(Device).filter(
+        Device.id == device_id,
+        Device.usuario_id == current_user.id
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    return device
 
 @router.delete("/{device_id}")
-def delete_device(device_id: int, authorization: str = Header(None), db: Session = Depends(get_db)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Falta token")
-    token = authorization.split(" ", 1)[1]
-    user = get_current_user(token, db)
-    dev = db.query(Device).filter(Device.id == device_id, Device.usuario_id == user.id).first()
-    if not dev:
-        raise HTTPException(status_code=404, detail="Equipo no encontrado")
-    db.delete(dev)
+async def delete_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    device = db.query(Device).filter(
+        Device.id == device_id,
+        Device.usuario_id == current_user.id
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    db.delete(device)
     db.commit()
     return {"ok": True}

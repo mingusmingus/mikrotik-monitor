@@ -2,51 +2,27 @@ import logging
 from datetime import datetime, timedelta
 from typing import List
 
+from celery import shared_task
 from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
 from app.db.session import SessionLocal
 from app.db.models.device import Device
 from app.db.models.alert import Alert
-from app.services.mikrotik import analyze_device_health
+from app.services.mikrotik import analyze_device_health, get_health, get_logs
 from app.services.ai_analysis import analyze_logs_with_ai, generate_alert_from_ai_analysis
 
 logger = logging.getLogger(__name__)
 
 @celery_app.task
 def monitor_devices() -> str:
-    """
-    Tarea programada para monitorear todos los dispositivos activos.
-    """
+    """Monitorea dispositivos cada 15 min"""
     db = SessionLocal()
     try:
-        # Obtener todos los dispositivos activos
-        devices = db.query(Device).filter(Device.is_active == True).all()
-        
-        if not devices:
-            return "No active devices found"
-        
-        total_devices = len(devices)
-        processed_devices = 0
-        total_alerts = 0
-        
+        devices = db.query(Device).filter(Device.activo==True).all()
         for device in devices:
-            try:
-                # Analizar salud del dispositivo
-                alerts = analyze_device_health(device, db)
-                total_alerts += len(alerts)
-                processed_devices += 1
-                
-                logger.info(f"Monitored device {device.name} ({device.ip_address}), generated {len(alerts)} alerts")
-            except Exception as e:
-                logger.error(f"Error monitoring device {device.name} ({device.ip_address}): {str(e)}")
-        
-        return f"Monitored {processed_devices}/{total_devices} devices, generated {total_alerts} alerts"
-    
-    except Exception as e:
-        logger.error(f"Error in monitor_devices task: {str(e)}")
-        return f"Error: {str(e)}"
-    
+            analyze_device_health(device, db)
+        return f"Monitoreados {len(devices)} dispositivos"
     finally:
         db.close()
 
@@ -66,8 +42,6 @@ def analyze_device_logs_with_ai(device_id: int) -> str:
             return f"Device {device.name} is not active"
         
         try:
-            from app.services.mikrotik import get_logs
-            
             # Obtener logs recientes
             logs = get_logs(device, limit=100)
             
@@ -115,5 +89,73 @@ def cleanup_old_alerts(days: int = 30) -> str:
         logger.error(f"Error in cleanup_old_alerts task: {str(e)}")
         return f"Error: {str(e)}"
     
+    finally:
+        db.close()
+
+@shared_task(
+    queue="monitor",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    max_retries=3
+)
+def poll_devices():
+    """Monitorea todos los dispositivos activos"""
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(Device.activo==True).all()
+        alerts_generated = 0
+
+        for device in devices:
+            try:
+                # Obtener métricas y logs
+                health = get_health(device)
+                logs = get_logs(device, limit=50)
+
+                # Analizar métricas de salud
+                if health['cpu_load'] > 80:
+                    db.add(Alert(
+                        equipo_id=device.id,
+                        estado="Alerta Mayor",
+                        titulo=f"CPU Alta: {health['cpu_load']}%",
+                        descripcion=f"La carga de CPU del dispositivo {device.nombre} está alta"
+                    ))
+                    alerts_generated += 1
+
+                memory_used_pct = (health['memory_used'] / health['memory_total']) * 100
+                if memory_used_pct > 90:
+                    db.add(Alert(
+                        equipo_id=device.id,
+                        estado="Alerta Crítica", 
+                        titulo=f"Memoria Crítica: {memory_used_pct:.1f}%",
+                        descripcion=f"El uso de memoria en {device.nombre} es crítico"
+                    ))
+                    alerts_generated += 1
+
+                # Analizar logs críticos recientes
+                critical_logs = [log for log in logs if log['severity'] == 'critical']
+                if critical_logs:
+                    db.add(Alert(
+                        equipo_id=device.id,
+                        estado="Alerta Crítica",
+                        titulo="Logs Críticos Detectados",
+                        descripcion=f"Se encontraron {len(critical_logs)} logs críticos"
+                    ))
+                    alerts_generated += 1
+
+                db.commit()
+
+            except Exception as e:
+                db.add(Alert(
+                    equipo_id=device.id,
+                    estado="Alerta Crítica",
+                    titulo="Error de Monitoreo",
+                    descripcion=f"Error al monitorear dispositivo: {str(e)}"
+                ))
+                db.commit()
+                alerts_generated += 1
+
+        return f"Monitoreados {len(devices)} dispositivos, generadas {alerts_generated} alertas"
+
     finally:
         db.close()
